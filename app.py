@@ -8,8 +8,6 @@ import traceback
 from fractions import Fraction
 
 import pymupdf  # PyMuPDF
-from openpyxl.worksheet.table import Table, TableStyleInfo
-from openpyxl.utils import get_column_letter
 
 # ============================================================
 # Session State Init
@@ -17,7 +15,7 @@ from openpyxl.utils import get_column_letter
 if "initialized" not in st.session_state:
     st.session_state.initialized = True
     st.session_state.page_files = None      # {page_num: xlsx_bytes}
-    st.session_state.page_summary = None    # [(page_num, kept_table_count, skipped_count)]
+    st.session_state.page_summary = None    # [(page_num, table_count)]
     st.session_state.basename = None
     st.session_state.preview_tables = None  # {page_num: [df, df, ...]}
 
@@ -137,23 +135,13 @@ def convert_dataframe(df, target_unit, frac_denom=16):
 # PDF Table Extraction
 # ============================================================
 
-def _clean_cell(v):
-    if v is None:
-        return ""
-    return str(v).strip()
-
-
 def extract_tables_from_page(page):
-    """Returns (kept_tables, skipped_count).
-    kept_tables is a list of pandas DataFrames containing ONLY the header
-    row and data rows (nothing else). Tables that end up with zero data
-    rows after cleaning are dropped entirely and counted in skipped_count."""
-    kept = []
-    skipped = 0
+    """Returns a list of pandas DataFrames, one per table found on the page."""
+    dfs = []
     try:
         tab_finder = page.find_tables()
     except Exception:
-        return kept, skipped
+        return dfs
 
     for tab in tab_finder.tables:
         try:
@@ -162,11 +150,10 @@ def extract_tables_from_page(page):
                 continue
             header = data[0]
             rows = data[1:]
-
             clean_header = []
             for i, h in enumerate(header):
-                h_str = _clean_cell(h)
-                clean_header.append(h_str if h_str else f"Column_{i + 1}")
+                h_str = str(h).strip() if h is not None and str(h).strip() != "" else f"Column_{i + 1}"
+                clean_header.append(h_str)
             # Guard against duplicate column names (Excel/pandas dislike them)
             seen = {}
             for i, h in enumerate(clean_header):
@@ -175,52 +162,21 @@ def extract_tables_from_page(page):
                     clean_header[i] = f"{h}_{seen[h]}"
                 else:
                     seen[h] = 0
-
             df = pd.DataFrame(rows, columns=clean_header)
-            # Keep only header + data: strip whitespace and drop rows that
-            # are entirely empty (no real data in any column).
-            df = df.apply(lambda col: col.map(_clean_cell))
-            df = df[~df.apply(lambda row: all(cell == "" for cell in row), axis=1)]
-            df = df.reset_index(drop=True)
-
-            if df.shape[0] == 0:
-                # Header-only table (no data rows) -> ignore entirely
-                skipped += 1
-                continue
-
-            kept.append(df)
+            dfs.append(df)
         except Exception:
             continue
-    return kept, skipped
+    return dfs
 
 
-def build_page_workbook(tables, target_unit, frac_denom=16, as_excel_table=False):
-    """Builds one xlsx (in-memory) for a single page, one sheet per table.
-    If as_excel_table is True, each sheet's range is formatted as a proper
-    Excel Table (filter dropdowns + banded rows)."""
+def build_page_workbook(tables, target_unit, frac_denom=16):
+    """Builds one xlsx (in-memory) for a single page, one sheet per table."""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         for i, df in enumerate(tables, start=1):
             converted = convert_dataframe(df, target_unit, frac_denom)
             sheet_name = f"Table_{i}"[:31]
             converted.to_excel(writer, sheet_name=sheet_name, index=False)
-
-            if as_excel_table:
-                ws = writer.sheets[sheet_name]
-                n_rows = converted.shape[0] + 1  # + header row
-                n_cols = converted.shape[1]
-                if n_rows >= 2 and n_cols >= 1:
-                    last_col = get_column_letter(n_cols)
-                    ref = f"A1:{last_col}{n_rows}"
-                    excel_table = Table(displayName=f"Tbl_{i}", ref=ref)
-                    excel_table.tableStyleInfo = TableStyleInfo(
-                        name="TableStyleMedium9",
-                        showRowStripes=True,
-                        showFirstColumn=False,
-                        showLastColumn=False,
-                        showColumnStripes=False,
-                    )
-                    ws.add_table(excel_table)
     output.seek(0)
     return output.getvalue()
 
@@ -235,10 +191,8 @@ st.info(
 **How to use this tool:**
 1. **Upload a PDF** below (e.g. drawings/specs with tables and dimensions).
 2. Choose the **dimension unit** you want values converted to — Decimal or Architectural.
-3. Choose whether extracted data should be formatted as an Excel Table.
-4. Click **Extract Tables**. You'll get **one XLSX file per page**, with **one sheet per table**
-   found on that page — only the header row and its data rows are included. Tables that have a
-   header but no data rows are skipped entirely. Download individually or all together as a ZIP.
+3. Click **Extract Tables**. You'll get **one XLSX file per page**, with **one sheet per table**
+   found on that page. Download them individually or all together as a ZIP.
 """
 )
 
@@ -273,19 +227,7 @@ if target_unit == "architectural":
 
 st.divider()
 
-st.subheader("3. Excel Table Formatting")
-table_format_choice = st.radio(
-    "Would you like the extracted data converted into a formatted Excel Table "
-    "(adds column filter dropdowns and banded row styling)?",
-    ["Yes", "No"],
-    horizontal=True,
-    help="If No, data is written as plain cells with a bold header row only.",
-)
-as_excel_table = table_format_choice == "Yes"
-
-st.divider()
-
-st.subheader("4. Extract")
+st.subheader("3. Extract")
 
 if uploaded_pdf is None:
     st.warning("Upload a PDF above to continue.")
@@ -298,19 +240,17 @@ else:
                 basename = os.path.splitext(uploaded_pdf.name)[0]
 
                 page_files = {}
-                page_summary = []  # (page_num, kept_count, skipped_count)
+                page_summary = []
                 preview_tables = {}
 
                 for page_index in range(len(doc)):
                     page = doc.load_page(page_index)
-                    tables, skipped_count = extract_tables_from_page(page)
+                    tables = extract_tables_from_page(page)
                     page_num = page_index + 1
-                    page_summary.append((page_num, len(tables), skipped_count))
+                    page_summary.append((page_num, len(tables)))
                     if tables:
                         converted_tables = [convert_dataframe(df, target_unit, frac_denom) for df in tables]
-                        wb_bytes = build_page_workbook(
-                            tables, target_unit, frac_denom, as_excel_table=as_excel_table
-                        )
+                        wb_bytes = build_page_workbook(tables, target_unit, frac_denom)
                         page_files[page_num] = wb_bytes
                         preview_tables[page_num] = converted_tables
 
@@ -332,7 +272,7 @@ else:
 
 if st.session_state.page_files is not None:
     st.divider()
-    st.subheader("5. Results")
+    st.subheader("4. Results")
 
     page_files = st.session_state.page_files
     page_summary = st.session_state.page_summary
@@ -341,25 +281,21 @@ if st.session_state.page_files is not None:
 
     total_pages = len(page_summary)
     pages_with_tables = len(page_files)
-    total_tables = sum(kept for _, kept, _ in page_summary)
-    total_skipped = sum(skipped for _, _, skipped in page_summary)
+    total_tables = sum(c for _, c in page_summary)
 
     st.success(
-        f"Scanned {total_pages} page(s). Kept {total_tables} table(s) with data across "
-        f"{pages_with_tables} page(s)."
+        f"Scanned {total_pages} page(s). Found {total_tables} table(s) across "
+        f"{pages_with_tables} page(s) with data."
     )
-    if total_skipped:
-        st.caption(f"Ignored {total_skipped} header-only table(s) that had no data rows.")
 
     with st.expander("Per-page table counts"):
-        for pg, kept, skipped in page_summary:
-            note = f" ({skipped} header-only table(s) ignored)" if skipped else ""
-            st.write(f"• Page {pg}: {kept} table(s) kept{note}")
+        for pg, cnt in page_summary:
+            st.write(f"• Page {pg}: {cnt} table(s)")
 
-    no_table_pages = [pg for pg, kept, _ in page_summary if kept == 0]
+    no_table_pages = [pg for pg, cnt in page_summary if cnt == 0]
     if no_table_pages:
         st.warning(
-            "No usable tables found on page(s): " + ", ".join(str(p) for p in no_table_pages) +
+            "No tables detected on page(s): " + ", ".join(str(p) for p in no_table_pages) +
             ". These pages were skipped (no file generated)."
         )
 
@@ -380,9 +316,8 @@ if st.session_state.page_files is not None:
         )
 
         st.markdown("**Or download individual page files:**")
-        kept_lookup = {pg: kept for pg, kept, _ in page_summary}
         for pg, data in page_files.items():
-            table_count = kept_lookup[pg]
+            table_count = dict(page_summary)[pg]
             col1, col2 = st.columns([3, 1])
             with col1:
                 st.write(f"Page {pg} — {table_count} table(s)")
