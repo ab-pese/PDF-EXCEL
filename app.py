@@ -9,6 +9,120 @@ from fractions import Fraction
 
 import pymupdf  # PyMuPDF
 
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+# ============================================================
+# Google OAuth Config
+# ============================================================
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.file",
+]
+
+
+def _google_oauth_configured():
+    return "google_oauth" in st.secrets and all(
+        k in st.secrets["google_oauth"] for k in ("client_id", "client_secret", "redirect_uri")
+    )
+
+
+def _get_flow():
+    cfg = st.secrets["google_oauth"]
+    client_config = {
+        "web": {
+            "client_id": cfg["client_id"],
+            "client_secret": cfg["client_secret"],
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [cfg["redirect_uri"]],
+        }
+    }
+    return Flow.from_client_config(
+        client_config, scopes=GOOGLE_SCOPES, redirect_uri=cfg["redirect_uri"]
+    )
+
+
+def _handle_oauth_redirect():
+    """If we just got redirected back from Google with a ?code=..., exchange
+    it for credentials and store them in session state."""
+    if "google_creds" in st.session_state:
+        return
+    params = st.query_params
+    if "code" in params:
+        try:
+            flow = _get_flow()
+            flow.fetch_token(code=params["code"])
+            st.session_state.google_creds = flow.credentials
+        except Exception as e:
+            st.session_state.google_auth_error = f"{type(e).__name__}: {e}"
+        finally:
+            st.query_params.clear()
+            st.rerun()
+
+
+def upload_to_google_sheets(creds, title, page_tables):
+    """Create one Google Sheet, one tab per (page, table), and fill it in.
+    page_tables: {page_num: [df, df, ...]} (already unit-converted)
+    Returns the shareable edit URL."""
+    sheets_service = build("sheets", "v4", credentials=creds)
+    drive_service = build("drive", "v3", credentials=creds)
+
+    spreadsheet = sheets_service.spreadsheets().create(
+        body={"properties": {"title": title}}, fields="spreadsheetId"
+    ).execute()
+    spreadsheet_id = spreadsheet["spreadsheetId"]
+
+    # Build the list of tab names first
+    tab_names = []
+    for pg, dfs in page_tables.items():
+        for i in range(1, len(dfs) + 1):
+            tab_names.append(f"P{pg}_T{i}"[:100])
+
+    requests = []
+    for idx, name in enumerate(tab_names):
+        if idx == 0:
+            requests.append({
+                "updateSheetProperties": {
+                    "properties": {"sheetId": 0, "title": name},
+                    "fields": "title",
+                }
+            })
+        else:
+            requests.append({"addSheet": {"properties": {"title": name}}})
+
+    if requests:
+        sheets_service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id, body={"requests": requests}
+        ).execute()
+
+    # Write the data into each tab
+    data_updates = []
+    tab_iter = iter(tab_names)
+    for pg, dfs in page_tables.items():
+        for df in dfs:
+            name = next(tab_iter)
+            values = [list(map(str, df.columns))] + df.astype(str).values.tolist()
+            data_updates.append({"range": f"'{name}'!A1", "values": values})
+
+    if data_updates:
+        sheets_service.spreadsheets().values().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"valueInputOption": "RAW", "data": data_updates},
+        ).execute()
+
+    # Make it viewable by anyone with the link (does not affect edit rights)
+    try:
+        drive_service.permissions().create(
+            fileId=spreadsheet_id, body={"role": "reader", "type": "anyone"}
+        ).execute()
+    except HttpError:
+        pass  # sharing permission failed; owner can still open/share manually
+
+    return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
+
+
 # ============================================================
 # Session State Init
 # ============================================================
@@ -18,8 +132,12 @@ if "initialized" not in st.session_state:
     st.session_state.page_summary = None    # [(page_num, table_count)]
     st.session_state.basename = None
     st.session_state.preview_tables = None  # {page_num: [df, df, ...]}
+    st.session_state.gsheet_link = None
+    st.session_state.google_auth_error = None
 
 st.set_page_config(page_title="PDF Table Extractor", layout="wide")
+
+_handle_oauth_redirect()
 
 # ============================================================
 # Dimension Conversion Helpers (Architectural <-> Decimal)
@@ -185,16 +303,20 @@ def build_page_workbook(tables, target_unit, frac_denom=16):
 # UI
 # ============================================================
 
-st.title("📐 PDF Table Extractor → XLSX")
+st.title("📐 PDF Table Extractor → XLSX / Google Sheets")
 st.info(
     """
 **How to use this tool:**
 1. **Upload a PDF** below (e.g. drawings/specs with tables and dimensions).
 2. Choose the **dimension unit** you want values converted to — Decimal or Architectural.
-3. Click **Extract Tables**. You'll get **one XLSX file per page**, with **one sheet per table**
-   found on that page. Download them individually or all together as a ZIP.
+3. Choose where you want the results to go — **XLSX download**, **Google Sheets**, or **both**.
+4. Click **Extract Tables**. Download the XLSX files and/or push the results straight to a Google Sheet in your own Google account.
 """
 )
+
+if st.session_state.google_auth_error:
+    st.error(f"Google sign-in failed: {st.session_state.google_auth_error}")
+    st.session_state.google_auth_error = None
 
 st.divider()
 
@@ -227,7 +349,62 @@ if target_unit == "architectural":
 
 st.divider()
 
-st.subheader("3. Extract")
+st.subheader("3. Output Destination")
+output_choice = st.radio(
+    "Where should the extracted tables go?",
+    ["XLSX files (download)", "Google Sheets (online)", "Both"],
+    horizontal=True,
+)
+want_xlsx = output_choice in ("XLSX files (download)", "Both")
+want_gsheet = output_choice in ("Google Sheets (online)", "Both")
+
+if want_gsheet:
+    if not _google_oauth_configured():
+        st.warning(
+            "Google Sheets export isn't configured yet. An admin needs to add a "
+            "`[google_oauth]` section (client_id, client_secret, redirect_uri) to "
+            "`.streamlit/secrets.toml` — see the setup guide below."
+        )
+        with st.expander("🔧 Google Sheets setup guide (for the app admin)"):
+            st.markdown(
+                """
+1. In [Google Cloud Console](https://console.cloud.google.com/), create (or pick) a project.
+2. Enable the **Google Sheets API** and **Google Drive API**.
+3. Configure the OAuth consent screen (External is fine for testing; add yourself as a test user).
+4. Create an **OAuth client ID** of type **Web application**.
+5. Add an **Authorized redirect URI** matching where this app is hosted, e.g.
+   `http://localhost:8501` for local dev, or `https://your-app-url` in production.
+6. Add these values to `.streamlit/secrets.toml`:
+```toml
+[google_oauth]
+client_id = "xxxxxxxx.apps.googleusercontent.com"
+client_secret = "xxxxxxxx"
+redirect_uri = "http://localhost:8501"
+```
+7. Restart the app.
+"""
+            )
+    else:
+        st.markdown("**Google account:**")
+        if "google_creds" not in st.session_state:
+            flow = _get_flow()
+            auth_url, _ = flow.authorization_url(
+                prompt="consent", access_type="offline", include_granted_scopes="true"
+            )
+            st.link_button("🔐 Sign in with Google", auth_url, use_container_width=False)
+        else:
+            col_a, col_b = st.columns([3, 1])
+            with col_a:
+                st.success("Signed in with Google ✅ — ready to create a Google Sheet.")
+            with col_b:
+                if st.button("Sign out"):
+                    del st.session_state.google_creds
+                    st.session_state.gsheet_link = None
+                    st.rerun()
+
+st.divider()
+
+st.subheader("4. Extract")
 
 if uploaded_pdf is None:
     st.warning("Upload a PDF above to continue.")
@@ -250,9 +427,10 @@ else:
                     page_summary.append((page_num, len(tables)))
                     if tables:
                         converted_tables = [convert_dataframe(df, target_unit, frac_denom) for df in tables]
-                        wb_bytes = build_page_workbook(tables, target_unit, frac_denom)
-                        page_files[page_num] = wb_bytes
                         preview_tables[page_num] = converted_tables
+                        if want_xlsx:
+                            wb_bytes = build_page_workbook(tables, target_unit, frac_denom)
+                            page_files[page_num] = wb_bytes
 
                 doc.close()
 
@@ -260,6 +438,7 @@ else:
             st.session_state.page_summary = page_summary
             st.session_state.basename = basename
             st.session_state.preview_tables = preview_tables
+            st.session_state.gsheet_link = None
 
         except Exception as e:
             st.error(f"Extraction failed: {type(e).__name__}: {e}")
@@ -270,17 +449,17 @@ else:
 # Results
 # ============================================================
 
-if st.session_state.page_files is not None:
+if st.session_state.preview_tables is not None:
     st.divider()
-    st.subheader("4. Results")
+    st.subheader("5. Results")
 
-    page_files = st.session_state.page_files
+    page_files = st.session_state.page_files or {}
     page_summary = st.session_state.page_summary
     basename = st.session_state.basename
     preview_tables = st.session_state.preview_tables
 
     total_pages = len(page_summary)
-    pages_with_tables = len(page_files)
+    pages_with_tables = len(preview_tables)
     total_tables = sum(c for _, c in page_summary)
 
     st.success(
@@ -296,45 +475,78 @@ if st.session_state.page_files is not None:
     if no_table_pages:
         st.warning(
             "No tables detected on page(s): " + ", ".join(str(p) for p in no_table_pages) +
-            ". These pages were skipped (no file generated)."
+            ". These pages were skipped."
         )
 
-    if page_files:
-        # Build a ZIP with one xlsx per page
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+    if not preview_tables:
+        st.warning("No tables were detected anywhere in this PDF, so no output was generated.")
+    else:
+        # ---------------- XLSX output ----------------
+        if want_xlsx and page_files:
+            st.markdown("### 📁 XLSX files")
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                for pg, data in page_files.items():
+                    zf.writestr(f"{basename}_page{pg}.xlsx", data)
+            zip_buffer.seek(0)
+
+            st.download_button(
+                "📦 Download All Pages (ZIP)",
+                data=zip_buffer,
+                file_name=f"{basename}_tables.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
+
+            st.markdown("**Or download individual page files:**")
             for pg, data in page_files.items():
-                zf.writestr(f"{basename}_page{pg}.xlsx", data)
-        zip_buffer.seek(0)
+                table_count = dict(page_summary)[pg]
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.write(f"Page {pg} — {table_count} table(s)")
+                with col2:
+                    st.download_button(
+                        "⬇️ Download",
+                        data=data,
+                        file_name=f"{basename}_page{pg}.xlsx",
+                        key=f"dl_page_{pg}",
+                        use_container_width=True,
+                    )
 
-        st.download_button(
-            "📦 Download All Pages (ZIP)",
-            data=zip_buffer,
-            file_name=f"{basename}_tables.zip",
-            mime="application/zip",
-            use_container_width=True,
-        )
+        # ---------------- Google Sheets output ----------------
+        if want_gsheet:
+            st.markdown("### 🟢 Google Sheets")
+            if not _google_oauth_configured():
+                st.info("Configure Google OAuth (see setup guide above) to enable this.")
+            elif "google_creds" not in st.session_state:
+                st.info("Sign in with Google above, then click the button below.")
+            else:
+                if st.button("📤 Create Google Sheet with these tables", use_container_width=True):
+                    with st.spinner("Creating your Google Sheet..."):
+                        try:
+                            link = upload_to_google_sheets(
+                                st.session_state.google_creds,
+                                f"{basename}_extracted_tables",
+                                preview_tables,
+                            )
+                            st.session_state.gsheet_link = link
+                        except HttpError as e:
+                            st.error(f"Google Sheets API error: {e}")
+                        except Exception as e:
+                            st.error(f"Upload failed: {type(e).__name__}: {e}")
+                            with st.expander("Show detailed error logs"):
+                                st.code(traceback.format_exc())
 
-        st.markdown("**Or download individual page files:**")
-        for pg, data in page_files.items():
-            table_count = dict(page_summary)[pg]
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                st.write(f"Page {pg} — {table_count} table(s)")
-            with col2:
-                st.download_button(
-                    "⬇️ Download",
-                    data=data,
-                    file_name=f"{basename}_page{pg}.xlsx",
-                    key=f"dl_page_{pg}",
-                    use_container_width=True,
-                )
+                if st.session_state.gsheet_link:
+                    st.success("Your Google Sheet is ready!")
+                    st.link_button(
+                        "📄 Open Google Sheet", st.session_state.gsheet_link, use_container_width=True
+                    )
 
+        # ---------------- Preview ----------------
         with st.expander("Preview extracted tables"):
             for pg, dfs in preview_tables.items():
                 st.markdown(f"**Page {pg}**")
                 for i, df in enumerate(dfs, start=1):
                     st.caption(f"Table {i}")
                     st.dataframe(df, use_container_width=True)
-    else:
-        st.warning("No tables were detected anywhere in this PDF, so no files were generated.")
